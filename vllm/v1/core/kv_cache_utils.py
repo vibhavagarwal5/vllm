@@ -940,8 +940,10 @@ def unify_kv_cache_spec_page_size(
             layer_page_size = layer_spec.page_size_bytes
             if max_page_size % layer_page_size != 0:
                 raise NotImplementedError(
-                    "The page size of the layer is not divisible by the "
-                    "maximum page size. Cannot unify by adjusting block_size."
+                    "The maximum page size is not divisible by the "
+                    "layer page size. Cannot unify by adjusting block_size."
+                    f" max={max_page_size} layer={layer_page_size}"
+                    f" mod={max_page_size % layer_page_size}"
                 )
             ratio = max_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio

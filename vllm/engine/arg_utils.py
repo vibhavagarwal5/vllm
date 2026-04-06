@@ -1622,26 +1622,43 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
-        # TurboQuant boundary layer protection: auto-populate skip layers
-        # from TQ_BOUNDARY_LAYERS env var when using TQ cache dtype.
-        # Disabled for hybrid models (attention+mamba) because boundary
-        # layers use native dtype, creating a page size mismatch that
-        # breaks the required page size unification.
+        # TurboQuant boundary layer protection: auto-populate skip layers.
+        # Default 0: boundary layers create mixed backends (shape mismatch).
+        # Also disabled for hybrid and heterogeneous head_dim models.
         n_boundary = int(os.environ.get("TQ_BOUNDARY_LAYERS", "2"))
-        if (resolved_cache_dtype.startswith("tq-") and n_boundary > 0
-                and not model_config.is_hybrid):
-            from vllm.model_executor.layers.quantization.turboquant.config import TurboQuantConfig
+        hf_tc = model_config.hf_text_config
+        has_hetero_heads = (
+            getattr(hf_tc, "head_dim", None) is not None
+            and getattr(hf_tc, "global_head_dim", None) is not None
+            and hf_tc.head_dim != hf_tc.global_head_dim
+        )
+        if (
+            resolved_cache_dtype.startswith("tq-")
+            and n_boundary > 0
+            and not model_config.is_hybrid
+            and not has_hetero_heads
+        ):
+            from vllm.model_executor.layers.quantization.turboquant.config import (
+                TurboQuantConfig,
+            )
+
             num_layers = model_config.hf_text_config.num_hidden_layers
             boundary_layers = TurboQuantConfig.get_boundary_skip_layers(
-                num_layers, n_boundary)
+                num_layers, n_boundary
+            )
             existing = set(cache_config.kv_cache_dtype_skip_layers)
-            merged = sorted(
-                existing | set(boundary_layers), key=lambda x: int(x))
+            all_layers = existing | set(boundary_layers)
+            numeric = sorted([x for x in all_layers if x.isdigit()], key=int)
+            non_numeric = sorted(x for x in all_layers if not x.isdigit())
+            merged = numeric + non_numeric
             cache_config.kv_cache_dtype_skip_layers = merged
             logger.info(
                 "TQ boundary protection: skipping layers %s "
                 "(TQ_BOUNDARY_LAYERS=%d, num_layers=%d)",
-                merged, n_boundary, num_layers)
+                merged,
+                n_boundary,
+                num_layers,
+            )
 
         ray_runtime_env = None
         if is_ray_initialized():

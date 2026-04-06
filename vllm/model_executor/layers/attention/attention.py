@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     SlidingWindowSpec,
+    TQSlidingWindowSpec,
     get_kv_quant_mode,
 )
 
@@ -257,8 +258,13 @@ class Attention(nn.Module, AttentionLayerBase):
             if str(layer_idx) in cache_config.kv_cache_dtype_skip_layers:
                 skip = True
             if skip:
-                kv_cache_dtype = "auto"
-                calculate_kv_scales = False
+                if kv_cache_dtype.startswith("tq-"):
+                    # TQ boundary: use FP8 passthrough (no rotation/quant)
+                    # instead of "auto" to stay on TURBOQUANT backend.
+                    kv_cache_dtype = "tq-k8v4"
+                else:
+                    kv_cache_dtype = "auto"
+                    calculate_kv_scales = False
             logger.info(
                 "Layer %s: kv_cache_dtype=%s, sliding_window=%s",
                 prefix,
@@ -406,18 +412,28 @@ class Attention(nn.Module, AttentionLayerBase):
         self, cache_dtype: str, head_size: int, prefix: str
     ) -> None:
         """Initialize TurboQuant rotation/projection matrices and centroids."""
-        from vllm.model_executor.layers.quantization.turboquant.config import TurboQuantConfig
+        from vllm.model_executor.layers.quantization.turboquant.centroids import (
+            get_centroids,
+        )
+        from vllm.model_executor.layers.quantization.turboquant.config import (
+            TurboQuantConfig,
+        )
         from vllm.model_executor.layers.quantization.turboquant.quantizer import (
             generate_rotation_matrix,
         )
-        from vllm.model_executor.layers.quantization.turboquant.centroids import get_centroids
 
         tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype, head_size)
 
         # Extract layer index from prefix (e.g. "model.layers.5.self_attn")
         from vllm.model_executor.models.utils import extract_layer_index
+
         layer_idx = extract_layer_index(prefix)
-        seed = tq_config.seed + layer_idx * 1337
+        # Shared KV layers must use their DONOR's rotation seed.
+        if self.kv_sharing_target_layer_name is not None:
+            donor_idx = extract_layer_index(self.kv_sharing_target_layer_name)
+            seed = tq_config.seed + donor_idx * 1337
+        else:
+            seed = tq_config.seed + layer_idx * 1337
 
         self.register_buffer(
             "_tq_Pi",
@@ -574,7 +590,8 @@ class Attention(nn.Module, AttentionLayerBase):
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
-        if self.sliding_window is not None:
+        _is_tq = self.kv_cache_dtype.startswith("tq-")
+        if self.sliding_window is not None and not _is_tq:
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"
             )
@@ -586,18 +603,57 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_quant_mode=quant_mode,
                 sliding_window=self.sliding_window,
             )
-        elif self.kv_cache_dtype.startswith("tq-"):
-            from vllm.model_executor.layers.quantization.turboquant.config import TurboQuantConfig
+        elif _is_tq:
+            from vllm.model_executor.layers.quantization.turboquant.config import (
+                TurboQuantConfig,
+            )
+
             tq_config = TurboQuantConfig.from_cache_dtype(
-                self.kv_cache_dtype, self.head_size)
-            padded_slot = tq_config.padded_slot_size
-            effective_head_size = padded_slot // 2
-            return FullAttentionSpec(
+                self.kv_cache_dtype, self.head_size
+            )
+            # When boundary layers exist, they have larger FP8 slots
+            # than inner MSE layers. Pad ALL TQ layers to the max slot
+            # so page sizes are uniform across all layers/spec types.
+            has_tq_boundary = bool(vllm_config.cache_config.kv_cache_dtype_skip_layers)
+            tq_shape_dtype = "tq-k8v4" if has_tq_boundary else self.kv_cache_dtype
+
+            if self.sliding_window is not None:
+                hf_tc = vllm_config.model_config.hf_text_config
+                g_hd = getattr(hf_tc, "global_head_dim", None)
+                s_hd = getattr(hf_tc, "head_dim", None)
+                is_hetero = g_hd is not None and s_hd is not None and g_hd != s_hd
+                if not is_hetero and not has_tq_boundary:
+                    return TQSlidingWindowSpec(
+                        block_size=block_size,
+                        num_kv_heads=self.num_kv_heads,
+                        head_size=self.head_size,
+                        dtype=self.kv_cache_torch_dtype,
+                        sliding_window=self.sliding_window,
+                        tq_slot_size=tq_config.slot_size,
+                        cache_dtype_str=tq_shape_dtype,
+                    )
+                # Heterogeneous or boundary: use FullAttentionSpec
+                # (pages can't unify with TQSlidingWindowSpec).
+
+            from vllm.v1.kv_cache_interface import TQFullAttentionSpec
+
+            # Determine slot size for page calculation.
+            # With boundary: use max slot (tq-k8v4) for uniform pages.
+            # Without boundary: use per-layer slot.
+            tq_slot = (
+                TurboQuantConfig.from_cache_dtype("tq-k8v4", self.head_size).slot_size
+                if has_tq_boundary
+                else tq_config.slot_size
+            )
+
+            return TQFullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
-                head_size=effective_head_size,
-                head_size_v=effective_head_size,
+                head_size=self.head_size,
+                head_size_v=self.head_size,
                 dtype=self.kv_cache_torch_dtype,
+                cache_dtype_str=tq_shape_dtype,
+                tq_slot_size=tq_slot,
             )
         else:
             return FullAttentionSpec(

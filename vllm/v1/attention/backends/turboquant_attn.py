@@ -115,10 +115,13 @@ class TurboQuantAttentionBackend(AttentionBackend):
         Each slot = [key_packed | value_fp16 | padding].
 
         Note: head_size here is the *effective* head_size from the spec
-        (= padded_slot // 2), NOT the model's actual head_dim.
-        So padded_slot = head_size * 2.
+        The C++ TQ4FullAttentionSpec computes real_page_size_bytes from
+        _tq4_bytes_per_token_kv(head_size). We match by computing
+        slot_size from TurboQuantConfig.
         """
-        return (num_blocks, block_size, num_kv_heads, head_size * 2)
+        from vllm.model_executor.layers.quantization.turboquant.config import TurboQuantConfig
+        tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype_str, head_size)
+        return (num_blocks, block_size, num_kv_heads, tq_config.slot_size)
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
@@ -533,7 +536,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Fast path: use flash_attn for first-chunk prefills (all K/V in batch).
         # max_query_len == max_seq_len means no request has prior cached KV.
         # Both are Python ints — no GPU sync.
-        if _HAS_FLASH_ATTN and attn_metadata.max_query_len == attn_metadata.max_seq_len:
+        # NOTE: FlashAttention supports head_dim <= 256 only.
+        if (_HAS_FLASH_ATTN
+                and self.head_size <= 256
+                and attn_metadata.max_query_len == attn_metadata.max_seq_len):
             output = torch.empty(N, Hq, D, device=query.device, dtype=query.dtype)
             flash_attn_varlen_func(
                 q=query,
@@ -678,7 +684,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         v_full = torch.cat([v_cached_trim.to(qdtype), val_chunk], dim=0)
 
         # Attention: q_len queries attending to seq_len K/V with causal mask
-        if _HAS_FLASH_ATTN:
+        # NOTE: FlashAttention supports head_dim <= 256 only.
+        if _HAS_FLASH_ATTN and D <= 256:
             output = torch.empty(q_len, Hq, D, device=device, dtype=query.dtype)
             cu_seqlens_q = torch.tensor(
                 [0, q_len], device=device, dtype=torch.int32)

@@ -83,13 +83,19 @@ class Gemma4Config(VerifyAndUpdateConfig):
         # This avoids unnecessary backend forcing on smaller models where
         # the config carries global_head_dim but all layers can still use
         # the same FA backend.
+        #
+        # Skip backend override when TurboQuant KV cache is requested —
+        # TQ's own prefill path handles head_dim > 256 via SDPA fallback.
         max_head_dim = max(head_dim or 0, global_head_dim or 0)
+        cache_dtype = getattr(vllm_config.cache_config, "cache_dtype", None)
+        is_tq = cache_dtype is not None and cache_dtype.startswith("tq-")
         if (
             head_dim is not None
             and global_head_dim is not None
             and head_dim != global_head_dim
             and max_head_dim > 256
             and vllm_config.attention_config.backend is None
+            and not is_tq
         ):
             from vllm.v1.attention.backends.registry import (
                 AttentionBackendEnum,
