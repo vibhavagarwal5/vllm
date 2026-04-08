@@ -296,8 +296,80 @@ class TestLloydMax:
 CUDA_AVAILABLE = torch.cuda.is_available()
 
 from vllm.model_executor.layers.quantization.turboquant.quantizer import (
+    generate_hadamard_matrix,
+    generate_random_signs,
     generate_rotation_matrix,
 )
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+class TestWHTRotation:
+    """Tests for WHT (Walsh-Hadamard Transform) rotation primitives."""
+
+    @pytest.mark.parametrize("dim", [64, 128, 256])
+    def test_hadamard_orthogonal(self, dim):
+        H = generate_hadamard_matrix(dim).to("cuda")
+        eye = H @ H.T
+        assert torch.allclose(eye, torch.eye(dim, device="cuda"),
+                              atol=1e-5), f"H not orthogonal for dim={dim}"
+
+    def test_hadamard_cached(self):
+        H1 = generate_hadamard_matrix(128)
+        H2 = generate_hadamard_matrix(128)
+        assert H1 is H2  # same object from lru_cache
+
+    @pytest.mark.parametrize("dim", [64, 128, 256])
+    def test_signs_shape_and_values(self, dim):
+        signs = generate_random_signs(dim, seed=42)
+        assert signs.shape == (dim,)
+        assert torch.all((signs == 1.0) | (signs == -1.0))
+
+    def test_signs_deterministic(self):
+        s1 = generate_random_signs(128, seed=42)
+        s2 = generate_random_signs(128, seed=42)
+        assert torch.equal(s1, s2)
+
+    def test_signs_different_seeds(self):
+        s1 = generate_random_signs(128, seed=42)
+        s2 = generate_random_signs(128, seed=99)
+        assert not torch.equal(s1, s2)
+
+    @pytest.mark.parametrize("dim", [64, 128, 256])
+    def test_combined_rotation_orthogonal(self, dim):
+        """H * diag(signs) must be orthogonal."""
+        H = generate_hadamard_matrix(dim).to("cuda")
+        signs = generate_random_signs(dim, seed=42, device="cuda")
+        R = H * signs  # broadcasting: (D,D) * (D,)
+        eye = R @ R.T
+        assert torch.allclose(eye, torch.eye(dim, device="cuda"),
+                              atol=1e-5)
+
+    def test_wht_better_gaussianization(self):
+        """WHT should produce kurtosis closer to 3.0 than QR."""
+        dim = 128
+        torch.manual_seed(0)
+        x = torch.randn(1000, dim, device="cuda")
+        x = x / x.norm(dim=1, keepdim=True)
+
+        # WHT rotation
+        H = generate_hadamard_matrix(dim).to("cuda")
+        signs = generate_random_signs(dim, seed=42, device="cuda")
+        y_wht = (x * signs) @ H.T
+
+        # QR rotation
+        Pi = generate_rotation_matrix(dim, seed=42, device="cuda")
+        y_qr = x @ Pi.T
+
+        def kurtosis(t):
+            m = t.mean(dim=0)
+            s = t.std(dim=0)
+            return ((((t - m) / s) ** 4).mean(dim=0)).mean().item()
+
+        k_wht = kurtosis(y_wht)
+        k_qr = kurtosis(y_qr)
+        # WHT kurtosis should be closer to Gaussian (3.0)
+        assert abs(k_wht - 3.0) < abs(k_qr - 3.0), \
+            f"WHT kurtosis {k_wht:.2f} not closer to 3.0 than QR {k_qr:.2f}"
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")

@@ -235,16 +235,27 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self._n_centroids = cfg.n_centroids if not cfg.key_fp8 else 1
 
     def _ensure_on_device(self, layer, device):
-        """One-time migration of TQ buffers to the correct device."""
-        Pi = layer._tq_Pi
-        if Pi.device != device:
-            layer._tq_Pi = Pi.to(device)
+        """One-time migration of TQ buffers to the correct device.
+
+        Builds the effective rotation matrix from WHT components:
+        PiT = (H * signs).T  — equivalent to a random orthogonal matrix
+        but with better Gaussianization (kurtosis ~3.0 vs ~4.5 for QR).
+        """
+        H = layer._tq_H
+        if H.device != device:
+            layer._tq_H = H.to(device)
+            layer._tq_signs = layer._tq_signs.to(device)
             layer._tq_centroids = layer._tq_centroids.to(device)
         # Cache contiguous float32 matrices and precomputed midpoints
         if not hasattr(layer, '_tq_cached'):
-            Pi_f = layer._tq_Pi.float().contiguous()
+            H_f = layer._tq_H.to(device).float()
+            signs = layer._tq_signs.to(device).float()
+            # WHT rotation: R = H * diag(signs), so R.T = (H * signs).T
+            # This is the matrix applied as x_hat @ PiT in store/decode.
+            layer._tq_PiT = (H_f * signs).T.contiguous()
+            # Inverse rotation: Pi = PiT.T (orthogonal → inverse = transpose)
+            layer._tq_Pi = layer._tq_PiT.T.contiguous()
             c = layer._tq_centroids.float()
-            layer._tq_PiT = Pi_f.T.contiguous()
             # Precompute midpoints for threshold-based quantization
             c_sorted, _ = c.sort()
             layer._tq_midpoints = ((c_sorted[:-1] + c_sorted[1:]) / 2)
