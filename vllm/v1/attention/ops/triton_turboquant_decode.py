@@ -15,16 +15,7 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
-_SM_COUNT: int | None = None
 _FP8_E4B15: int | None = None
-
-
-def _get_sm_count(device: int = 0) -> int:
-    global _SM_COUNT
-    if _SM_COUNT is None:
-        _SM_COUNT = torch.cuda.get_device_properties(
-            device).multi_processor_count
-    return _SM_COUNT
 
 
 def _use_fp8_e4b15(device: int = 0) -> int:
@@ -459,6 +450,7 @@ def triton_turboquant_decode_attention(
     output_buf: torch.Tensor | None = None,
     lse_buf: torch.Tensor | None = None,
     buf_holder: object | None = None,
+    max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -486,28 +478,7 @@ def triton_turboquant_decode_attention(
             PiT = Pi.T.contiguous()
         q_rot = (q_float @ PiT).contiguous()
 
-    # Occupancy-aware NUM_KV_SPLITS
-    MIN_TOKENS_PER_SPLIT = 128
-    max_seq = max_seq_len if max_seq_len > 0 else num_kv_splits * MIN_TOKENS_PER_SPLIT
-    effective = max(1, max_seq // MIN_TOKENS_PER_SPLIT)
-    NUM_KV_SPLITS = 1
-    while NUM_KV_SPLITS * 2 <= min(effective, num_kv_splits):
-        NUM_KV_SPLITS *= 2
-
-    SM_COUNT = _get_sm_count()
-    TARGET_GRID = SM_COUNT * 2
-    grid_blocks = B * Hk * NUM_KV_SPLITS
-    if grid_blocks < TARGET_GRID:
-        needed = math.ceil(TARGET_GRID / (B * Hk))
-        ns = NUM_KV_SPLITS
-        while ns < needed and ns < 128:
-            ns *= 2
-        max_allowed = max(1, max_seq // 16)
-        ns = min(ns, max_allowed, 128)
-        final = NUM_KV_SPLITS
-        while final * 2 <= ns:
-            final *= 2
-        NUM_KV_SPLITS = final
+    NUM_KV_SPLITS = max_num_kv_splits
 
     if (mid_o_buf is not None
             and mid_o_buf.shape[0] >= B

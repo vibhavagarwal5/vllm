@@ -24,6 +24,7 @@ from typing import ClassVar, Optional
 import torch
 import torch.nn.functional as F
 
+from vllm.config import get_current_vllm_config
 from vllm.triton_utils import triton
 from vllm.utils.torch_utils import aux_stream
 from vllm.v1.attention.ops.triton_turboquant_decode import (
@@ -255,6 +256,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             head_size * cfg.effective_value_quant_bits / 8)
         self._n_centroids = cfg.n_centroids if not cfg.key_fp8 else 1
 
+        # Fixed NUM_KV_SPLITS (grid dims must be constant for cudagraph,
+        # and benchmarks show no regression vs dynamic in eager mode).
+        vllm_config = get_current_vllm_config()
+        self.max_num_kv_splits = (
+            vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph)
+        self._max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+
     def _ensure_on_device(self, layer, device):
         """One-time migration of TQ buffers to the correct device."""
         Pi = layer._tq_Pi
@@ -269,9 +277,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # Precompute midpoints for threshold-based quantization
             c_sorted, _ = c.sort()
             layer._tq_midpoints = ((c_sorted[:-1] + c_sorted[1:]) / 2)
-            # Decode buffers are lazily allocated on first decode call
-            # to avoid reserving memory during init (the exact batch size
-            # and NUM_KV_SPLITS are not known until the first request).
+            # Decode buffers are lazily allocated on first decode call.
+            # With fixed NUM_KV_SPLITS (cudagraph mode), the first warmup
+            # allocates them and subsequent captures reuse via buf_holder.
             layer._tq_mid_o_buf = None
             layer._tq_output_buf = None
             layer._tq_lse_buf = None
@@ -744,5 +752,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             output_buf=output_buf,
             lse_buf=lse_buf,
             buf_holder=layer,
+            max_num_kv_splits=self.max_num_kv_splits,
         )
         return result
