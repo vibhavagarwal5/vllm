@@ -132,12 +132,12 @@ class TurboQuantAttentionBackend(AttentionBackend):
         to native dtype via kv_cache_dtype_skip_layers get their own
         standard-shaped cache allocation.
 
-        head_size is the model's real head_dim. padded_slot_size is computed
+        head_size is the model's real head_dim. slot_size_aligned is computed
         from the TQ config to ensure correct cache allocation for all head dims.
         """
         from vllm.model_executor.layers.quantization.turboquant.config import TurboQuantConfig
         tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype_str, head_size)
-        return (num_blocks, block_size, num_kv_heads, tq_config.padded_slot_size)
+        return (num_blocks, block_size, num_kv_heads, tq_config.slot_size_aligned)
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
