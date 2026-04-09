@@ -440,8 +440,6 @@ def triton_turboquant_decode_attention(
     key_packed_size: int,
     value_quant_bits: int,
     value_packed_size: int,
-    num_kv_splits: int = 128,
-    max_seq_len: int = 0,
     key_fp8: bool = False,
     norm_correction: bool = False,
     PiT: torch.Tensor | None = None,  # [D, D] pre-computed Pi.T contiguous

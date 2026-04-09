@@ -261,7 +261,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         vllm_config = get_current_vllm_config()
         self.max_num_kv_splits = (
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph)
-        self._max_num_seqs = vllm_config.scheduler_config.max_num_seqs
 
     def _ensure_on_device(self, layer, device):
         """One-time migration of TQ buffers to the correct device."""
@@ -579,7 +578,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         value_quant_bits=(
                             self.tq_config.effective_value_quant_bits),
                         value_packed_size=self.tq_config.value_packed_size,
-                        max_seq_len=seq_len,
                         key_fp8=self.tq_config.key_fp8,
                         norm_correction=self.tq_config.norm_correction,
                         PiT=PiT,
@@ -744,7 +742,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             key_packed_size=self.tq_config.key_packed_size,
             value_quant_bits=self.tq_config.effective_value_quant_bits,
             value_packed_size=self.tq_config.value_packed_size,
-            max_seq_len=attn_metadata.max_seq_len,
             key_fp8=self.tq_config.key_fp8,
             norm_correction=self.tq_config.norm_correction,
             PiT=PiT,
