@@ -592,16 +592,16 @@ class Attention(nn.Module, AttentionLayerBase):
             )
         elif self.kv_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import TurboQuantConfig
+            from vllm.v1.kv_cache_interface import TQFullAttentionSpec
             tq_config = TurboQuantConfig.from_cache_dtype(
                 self.kv_cache_dtype, self.head_size)
-            padded_slot = tq_config.slot_size_aligned
-            effective_head_size = padded_slot // 2
-            return FullAttentionSpec(
+            return TQFullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
-                head_size=effective_head_size,
-                head_size_v=effective_head_size,
+                head_size=self.head_size,
+                head_size_v=self.head_size,
                 dtype=self.kv_cache_torch_dtype,
+                tq_slot_size=tq_config.slot_size_aligned,
             )
         else:
             return FullAttentionSpec(
