@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TurboQuant attention backend for vLLM.
 
 Prefill: Standard scaled dot-product attention on uncompressed K/V,
@@ -131,11 +132,12 @@ class TurboQuantAttentionBackend(AttentionBackend):
         to native dtype via kv_cache_dtype_skip_layers get their own
         standard-shaped cache allocation.
 
-        Note: head_size here is the *effective* head_size from the spec
-        (= padded_slot // 2), NOT the model's actual head_dim.
-        So padded_slot = head_size * 2.
+        head_size is the model's real head_dim. padded_slot_size is computed
+        from the TQ config to ensure correct cache allocation for all head dims.
         """
-        return (num_blocks, block_size, num_kv_heads, head_size * 2)
+        from vllm.model_executor.layers.quantization.turboquant.config import TurboQuantConfig
+        tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype_str, head_size)
+        return (num_blocks, block_size, num_kv_heads, tq_config.padded_slot_size)
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
