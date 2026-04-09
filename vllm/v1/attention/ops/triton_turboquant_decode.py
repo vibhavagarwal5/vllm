@@ -454,6 +454,11 @@ def triton_turboquant_decode_attention(
     key_fp8: bool = False,
     norm_correction: bool = False,
     PiT: torch.Tensor | None = None,  # [D, D] pre-computed Pi.T contiguous
+    # Pre-allocated buffers (optional, avoids per-call allocation)
+    mid_o_buf: torch.Tensor | None = None,
+    output_buf: torch.Tensor | None = None,
+    lse_buf: torch.Tensor | None = None,
+    buf_holder: object | None = None,
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -504,14 +509,20 @@ def triton_turboquant_decode_attention(
             final *= 2
         NUM_KV_SPLITS = final
 
-    mid_o = torch.empty(
-        B, Hq, NUM_KV_SPLITS, D + 1,
-        dtype=torch.float32, device=device,
-    )
+    if (mid_o_buf is not None
+            and mid_o_buf.shape[0] >= B
+            and mid_o_buf.shape[2] >= NUM_KV_SPLITS):
+        mid_o = mid_o_buf[:B, :Hq, :NUM_KV_SPLITS, :]
+    else:
+        mid_o = torch.empty(
+            B, Hq, NUM_KV_SPLITS, D + 1,
+            dtype=torch.float32, device=device,
+        )
+        if buf_holder is not None:
+            buf_holder._tq_mid_o_buf = mid_o
 
+    # Stage 1: split-KV tiled attention scoring + value accumulation
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
-
-    # Triton stage 1: split-KV tiled attention scoring + value accumulation
     BLOCK_KV = 4
     grid = (B, Hq, NUM_KV_SPLITS)
     _tq_decode_stage1[grid](
@@ -544,13 +555,23 @@ def triton_turboquant_decode_attention(
         KEY_FP8=1 if key_fp8 else 0,
         NORM_CORRECTION=1 if norm_correction else 0,
         FP8_E4B15=fp8_e4b15,
-        num_warps=2,
-        num_stages=2,
+        num_warps=1,
+        num_stages=1,
     )
 
     # Stage 2: Reduce across KV splits
-    output = torch.empty(B, Hq, D, dtype=torch.float32, device=device)
-    lse = torch.empty(B, Hq, dtype=torch.float32, device=device)
+    if output_buf is not None and output_buf.shape[0] >= B:
+        output = output_buf[:B, :Hq, :D]
+    else:
+        output = torch.empty(B, Hq, D, dtype=torch.float32, device=device)
+        if buf_holder is not None:
+            buf_holder._tq_output_buf = output
+    if lse_buf is not None and lse_buf.shape[0] >= B:
+        lse = lse_buf[:B, :Hq]
+    else:
+        lse = torch.empty(B, Hq, dtype=torch.float32, device=device)
+        if buf_holder is not None:
+            buf_holder._tq_lse_buf = lse
 
     grid2 = (B, Hq)
     _fwd_kernel_stage2[grid2](

@@ -269,6 +269,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # Precompute midpoints for threshold-based quantization
             c_sorted, _ = c.sort()
             layer._tq_midpoints = ((c_sorted[:-1] + c_sorted[1:]) / 2)
+            # Decode buffers are lazily allocated on first decode call
+            # to avoid reserving memory during init (the exact batch size
+            # and NUM_KV_SPLITS are not known until the first request).
+            layer._tq_mid_o_buf = None
+            layer._tq_output_buf = None
+            layer._tq_lse_buf = None
             layer._tq_cached = True
 
     def do_kv_cache_update(
@@ -370,7 +376,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         if not attn_metadata.is_prefill:
             # Pure decode batch — fast path
             attn_out = self._decode_attention(q, kv_cache, attn_metadata,
-                                              Pi, centroids, PiT)
+                                              Pi, centroids, PiT, layer)
         elif num_decodes == 0:
             # Pure prefill batch
             k = key[:N].view(N, self.num_kv_heads, self.head_size)
@@ -396,7 +402,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
             attn_out[:num_decode_tokens] = self._decode_attention(
                 q[:num_decode_tokens], kv_cache, decode_meta,
-                Pi, centroids, PiT)
+                Pi, centroids, PiT, layer)
 
             # --- Prefill portion (remaining requests) ---
             # CRITICAL: use prefill-specific max_seq_len so flash_attn's
@@ -709,8 +715,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         Pi: torch.Tensor,
         centroids: torch.Tensor,
         PiT: torch.Tensor | None = None,
+        layer: torch.nn.Module | None = None,
     ) -> torch.Tensor:
-        return triton_turboquant_decode_attention(
+        # Grab cached decode buffers from the layer (lazily allocated).
+        mid_o_buf = output_buf = lse_buf = None
+        if layer is not None:
+            mid_o_buf = getattr(layer, '_tq_mid_o_buf', None)
+            output_buf = getattr(layer, '_tq_output_buf', None)
+            lse_buf = getattr(layer, '_tq_lse_buf', None)
+
+        result = triton_turboquant_decode_attention(
             query=query,
             kv_cache=kv_cache,
             block_table=attn_metadata.block_table,
@@ -726,4 +740,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             key_fp8=self.tq_config.key_fp8,
             norm_correction=self.tq_config.norm_correction,
             PiT=PiT,
+            mid_o_buf=mid_o_buf,
+            output_buf=output_buf,
+            lse_buf=lse_buf,
+            buf_holder=layer,
         )
+        return result
