@@ -8,7 +8,6 @@ Supports FP8 (E4M3) keys, 3-bit and 4-bit uniform quantized values.
 """
 
 import math
-import os
 import torch
 
 from vllm.logger import init_logger
@@ -108,7 +107,7 @@ def _tq_decode_stage1(
 
     # Load query vector: q_rot — [BLOCK_D] float32
     q_base = bid * stride_qb + hid * stride_qh
-    q_rot = tl.load(Q_rot_ptr + q_base + d_offs, mask=d_mask, other=0.0)
+    q_rot = tl.load(Q_rot_ptr + q_base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
 
     # Precompute byte/bit index vectors for MSE gather loads
     if not KEY_FP8:
@@ -472,8 +471,10 @@ def triton_turboquant_decode_attention(
     cfg = _get_layout(D, mse_bits, value_quant_bits, key_packed_size)
 
     # Compute q_rot = q @ Pi.T (rotated query for MSE key scoring)
+    # FP8 path: pass query directly (float16); kernel casts inline.
+    # MSE path: still needs external GEMM (cuBLAS), so q_rot is float32.
     if key_fp8:
-        q_rot = query.float().contiguous()
+        q_rot = query.contiguous()
     else:
         q_float = query.float()
         if PiT is None:
@@ -543,7 +544,7 @@ def triton_turboquant_decode_attention(
         KEY_FP8=1 if key_fp8 else 0,
         NORM_CORRECTION=1 if norm_correction else 0,
         FP8_E4B15=fp8_e4b15,
-        num_warps=4,
+        num_warps=2,
         num_stages=2,
     )
 
