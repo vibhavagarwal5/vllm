@@ -10,10 +10,7 @@ Supports FP8 (E4M3) keys, 3-bit and 4-bit uniform quantized values.
 import math
 import torch
 
-from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
-
-logger = init_logger(__name__)
 
 _FP8_E4B15: int | None = None
 
@@ -50,12 +47,9 @@ def _tq_decode_stage1(
     stride_bt_b,       # block_table stride per batch
     stride_mid_b, stride_mid_h, stride_mid_s,  # mid_o strides
     # Constexpr dims
-    NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,       # KV cache block_size (pages)
-    PADDED_SLOT: tl.constexpr,      # padded slot bytes
-    MAX_NUM_BLOCKS: tl.constexpr,
     NUM_KV_SPLITS: tl.constexpr,
     KV_GROUP_SIZE: tl.constexpr,    # Hq // Hk
     # TQ layout constants
@@ -64,7 +58,6 @@ def _tq_decode_stage1(
     KPS: tl.constexpr,              # key_packed_size
     VQB: tl.constexpr,              # value_quant_bits (4 or 8=FP8)
     VAL_DATA_BYTES: tl.constexpr,   # ceil(D * vqb / 8) or D for FP8
-    N_CENTROIDS: tl.constexpr,      # 2**MSE_BITS
     # Score constants
     ATTN_SCALE: tl.constexpr,       # 1/sqrt(D)
     # Block tile sizes
@@ -439,7 +432,6 @@ def triton_turboquant_decode_attention(
     mse_bits: int,
     key_packed_size: int,
     value_quant_bits: int,
-    value_packed_size: int,
     key_fp8: bool = False,
     norm_correction: bool = False,
     PiT: torch.Tensor | None = None,  # [D, D] pre-computed Pi.T contiguous
@@ -457,9 +449,6 @@ def triton_turboquant_decode_attention(
     B, Hq, D = query.shape
     Hk = kv_cache.shape[2]
     block_size = kv_cache.shape[1]
-    padded_slot = kv_cache.shape[3]
-    max_num_blocks = block_table.shape[1]
-    n_centroids = centroids.shape[0]
     kv_group_size = Hq // Hk
     device = query.device
 
@@ -504,12 +493,9 @@ def triton_turboquant_decode_attention(
         kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
         block_table.stride(0),
         mid_o.stride(0), mid_o.stride(1), mid_o.stride(2),
-        NUM_Q_HEADS=Hq,
         NUM_KV_HEADS=Hk,
         HEAD_DIM=D,
         BLOCK_SIZE=block_size,
-        PADDED_SLOT=padded_slot,
-        MAX_NUM_BLOCKS=max_num_blocks,
         NUM_KV_SPLITS=NUM_KV_SPLITS,
         KV_GROUP_SIZE=kv_group_size,
         MSE_BITS=mse_bits,
@@ -517,7 +503,6 @@ def triton_turboquant_decode_attention(
         KPS=key_packed_size,
         VQB=value_quant_bits,
         VAL_DATA_BYTES=cfg['val_data_bytes'],
-        N_CENTROIDS=n_centroids,
         ATTN_SCALE=scale,
         BLOCK_D=cfg['BLOCK_D'],
         BLOCK_KV=BLOCK_KV,

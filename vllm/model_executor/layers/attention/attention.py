@@ -408,7 +408,7 @@ class Attention(nn.Module, AttentionLayerBase):
         """Initialize TurboQuant rotation/projection matrices and centroids."""
         from vllm.model_executor.layers.quantization.turboquant.config import TurboQuantConfig
         from vllm.model_executor.layers.quantization.turboquant.quantizer import (
-            generate_rotation_matrix,
+            generate_wht_signs,
         )
         from vllm.model_executor.layers.quantization.turboquant.centroids import get_centroids
 
@@ -424,8 +424,8 @@ class Attention(nn.Module, AttentionLayerBase):
         seed = tq_config.seed + layer_idx * _TQ_LAYER_SEED_STRIDE
 
         self.register_buffer(
-            "_tq_Pi",
-            generate_rotation_matrix(head_size, seed=seed),
+            "_tq_signs",
+            generate_wht_signs(head_size, seed=seed),
         )
         self.register_buffer(
             "_tq_centroids",

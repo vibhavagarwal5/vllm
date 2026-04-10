@@ -16,6 +16,7 @@ Per-head per-position slot layout:
   For turboquant_k3v4_nc head_dim=256: [100 bytes key | 512 bytes value] = 612
 """
 
+import functools
 import math
 import os
 from dataclasses import dataclass
@@ -53,7 +54,6 @@ from vllm.v1.attention.backends.fa_utils import (
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
-from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -67,7 +67,18 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 
-logger = init_logger(__name__)
+
+@functools.lru_cache(maxsize=None)
+def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
+    """Orthonormal Hadamard matrix (Sylvester construction), built on CPU.
+
+    Precomputed D×D matrix enables matmul-based WHT — single cuBLAS GEMM
+    instead of log2(D) butterfly kernel launches. 64KB for D=128.
+    """
+    H = torch.tensor([[1.0]])
+    while H.shape[0] < d:
+        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+    return (H / math.sqrt(d)).to(torch.device(device_str))
 
 
 class TurboQuantAttentionBackend(AttentionBackend):
@@ -264,15 +275,20 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
     def _ensure_on_device(self, layer, device):
         """One-time migration of TQ buffers to the correct device."""
-        Pi = layer._tq_Pi
-        if Pi.device != device:
-            layer._tq_Pi = Pi.to(device)
+        if layer._tq_signs.device != device:
+            layer._tq_signs = layer._tq_signs.to(device)
             layer._tq_centroids = layer._tq_centroids.to(device)
-        # Cache contiguous float32 matrices and precomputed midpoints
         if not hasattr(layer, '_tq_cached'):
-            Pi_f = layer._tq_Pi.float().contiguous()
+            D = layer._tq_signs.shape[0]
+            signs = layer._tq_signs.float()
+
+            # WHT rotation: orthonormal + self-inverse, enabling future
+            # in-kernel butterfly fusion and trivial inverse for continuation.
+            H = _build_hadamard(D, str(device))
+            layer._tq_PiT = (signs.unsqueeze(1) * H).contiguous()
+            layer._tq_Pi = layer._tq_PiT.T.contiguous()
+
             c = layer._tq_centroids.float()
-            layer._tq_PiT = Pi_f.T.contiguous()
             # Precompute midpoints for threshold-based quantization
             c_sorted, _ = c.sort()
             layer._tq_midpoints = ((c_sorted[:-1] + c_sorted[1:]) / 2)
@@ -464,7 +480,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             mse_bits=self.tq_config.key_mse_bits,
             key_packed_size=self.tq_config.key_packed_size,
             value_quant_bits=self.tq_config.effective_value_quant_bits,
-            value_packed_size=self.tq_config.value_packed_size,
+
             key_fp8=self.tq_config.key_fp8,
         )
 
@@ -514,14 +530,19 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         output = torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
 
+        # Convert to Python lists once (single CPU-GPU sync) instead of
+        # per-request .item() calls that each force a sync.
+        qsl = query_start_loc.tolist()
+        seq_lens_list = attn_metadata.seq_lens.tolist()
+
         for i in range(num_reqs):
-            q_start = query_start_loc[i].item()
-            q_end = query_start_loc[i + 1].item()
+            q_start = qsl[i]
+            q_end = qsl[i + 1]
             q_len = q_end - q_start
             if q_len <= 0:
                 continue
 
-            seq_len = attn_metadata.seq_lens[i].item()
+            seq_len = seq_lens_list[i]
             q_seq = query[q_start:q_end]       # (q_len, Hq, D)
             k_seq = key[q_start:q_end]         # (q_len, Hk, D)
             v_seq = value[q_start:q_end]       # (q_len, Hk, D)
@@ -577,7 +598,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         key_packed_size=self.tq_config.key_packed_size,
                         value_quant_bits=(
                             self.tq_config.effective_value_quant_bits),
-                        value_packed_size=self.tq_config.value_packed_size,
+            
                         key_fp8=self.tq_config.key_fp8,
                         norm_correction=self.tq_config.norm_correction,
                         PiT=PiT,
@@ -741,7 +762,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             mse_bits=self.tq_config.key_mse_bits,
             key_packed_size=self.tq_config.key_packed_size,
             value_quant_bits=self.tq_config.effective_value_quant_bits,
-            value_packed_size=self.tq_config.value_packed_size,
+
             key_fp8=self.tq_config.key_fp8,
             norm_correction=self.tq_config.norm_correction,
             PiT=PiT,

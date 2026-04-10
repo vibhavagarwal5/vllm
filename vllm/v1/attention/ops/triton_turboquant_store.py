@@ -13,61 +13,30 @@ The launcher `triton_turboquant_store` selects the appropriate kernel.
 import math
 import torch
 
-from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
-
-logger = init_logger(__name__)
+from vllm.v1.attention.ops.triton_turboquant_decode import _use_fp8_e4b15
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# FP8 key store + value uniform quantization
+# Shared: value uniform quantization + pack + scale/zero store
 # ═══════════════════════════════════════════════════════════════════════
 
 @triton.jit
-def _tq_fused_store_fp8(
-    Value_ptr,         # [NH, D] float16/bfloat16 — raw values
-    KV_cache_ptr,      # [total_bytes] uint8 (flattened view)
-    Slot_mapping_ptr,  # [N] int32 — per-token slot indices
-    Key_fp8_ptr,       # [NH, D] uint8 — pre-cast FP8 keys
-    # Cache strides (for computing byte offsets)
-    stride_cache_block: tl.constexpr,
-    stride_cache_pos: tl.constexpr,
-    stride_cache_head: tl.constexpr,
-    # Dimensions
+def _store_quantized_value(
+    Value_ptr,
+    KV_cache_ptr,
+    base,           # pid * D offset into Value_ptr
+    slot_base,      # byte offset into KV_cache_ptr for this slot+head
+    d_offs,         # tl.arange(0, BLOCK_D)
+    d_mask,         # d_offs < D
     D: tl.constexpr,
-    H: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    # TQ layout
     KPS: tl.constexpr,
-    # Value quantization
     VQB: tl.constexpr,
     VAL_DATA_BYTES: tl.constexpr,
-    # Packing block sizes
     BLOCK_VAL: tl.constexpr,
-    BLOCK_GRP: tl.constexpr = 16,
+    BLOCK_GRP: tl.constexpr,
 ):
-    """FP8 key scatter + value uniform quantization: one program per (token, head)."""
-    pid = tl.program_id(0)
-    token_idx = pid // H
-    head_idx = pid % H
-
-    slot = tl.load(Slot_mapping_ptr + token_idx)
-    if slot < 0:
-        return
-    blk = slot // BLOCK_SIZE
-    off = slot % BLOCK_SIZE
-    slot_base = blk * stride_cache_block + off * stride_cache_pos + head_idx * stride_cache_head
-
-    base = pid * D
-
-    # ── FP8 KEY: write raw bytes directly to cache ──────────────────
-    d_offs = tl.arange(0, BLOCK_D)
-    d_mask = d_offs < D
-    k_bytes = tl.load(Key_fp8_ptr + base + d_offs, mask=d_mask, other=0)
-    tl.store(KV_cache_ptr + slot_base + d_offs, k_bytes, mask=d_mask)
-
-    # ── VALUE QUANTIZE + PACK ───────────────────────────────────────
+    """Uniform quantization of values to VQB bits, pack, and store with scale/zero."""
     val_cache_offset = KPS
 
     if VQB == 3:
@@ -114,14 +83,17 @@ def _tq_fused_store_fp8(
 
         val_offs = tl.arange(0, BLOCK_VAL)
         val_mask = val_offs < VAL_DATA_BYTES
-        v0 = tl.load(Value_ptr + base + val_offs * 2,     mask=val_mask & (val_offs * 2 < D), other=0.0).to(tl.float32)
-        v1 = tl.load(Value_ptr + base + val_offs * 2 + 1, mask=val_mask & (val_offs * 2 + 1 < D), other=0.0).to(tl.float32)
-        v0 = tl.where(val_mask & (val_offs * 2 < D), v0, val_min)
-        v1 = tl.where(val_mask & (val_offs * 2 + 1 < D), v1, val_min)
-        q0 = tl.minimum(tl.maximum(((v0 - val_min) / v_scale + 0.5).to(tl.int32), 0), 15)
-        q1 = tl.minimum(tl.maximum(((v1 - val_min) / v_scale + 0.5).to(tl.int32), 0), 15)
+        v0 = tl.load(Value_ptr + base + val_offs * 2,
+                     mask=val_mask & (val_offs * 2 < D), other=val_min)
+        v1 = tl.load(Value_ptr + base + val_offs * 2 + 1,
+                     mask=val_mask & (val_offs * 2 + 1 < D), other=val_min)
+        q0 = tl.minimum(tl.maximum(
+            ((v0 - val_min) / v_scale + 0.5).to(tl.int32), 0), 15)
+        q1 = tl.minimum(tl.maximum(
+            ((v1 - val_min) / v_scale + 0.5).to(tl.int32), 0), 15)
         packed_val = (q0 | (q1 << 4)).to(tl.uint8)
-        tl.store(KV_cache_ptr + slot_base + val_cache_offset + val_offs, packed_val, mask=val_mask)
+        tl.store(KV_cache_ptr + slot_base + val_cache_offset + val_offs,
+                 packed_val, mask=val_mask)
 
         sc_offset = val_cache_offset + VAL_DATA_BYTES
         sc_f16 = v_scale.to(tl.float16)
@@ -132,6 +104,68 @@ def _tq_fused_store_fp8(
         zr_u16 = zr_f16.to(tl.uint16, bitcast=True)
         tl.store(KV_cache_ptr + slot_base + sc_offset + 2, (zr_u16 & 0xFF).to(tl.uint8))
         tl.store(KV_cache_ptr + slot_base + sc_offset + 3, ((zr_u16 >> 8) & 0xFF).to(tl.uint8))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# FP8 key store + value uniform quantization
+# ═══════════════════════════════════════════════════════════════════════
+
+@triton.jit
+def _tq_fused_store_fp8(
+    Key_ptr,           # [NH, D] float16/bfloat16 — raw keys
+    Value_ptr,         # [NH, D] float16/bfloat16 — raw values
+    KV_cache_ptr,      # [total_bytes] uint8 (flattened view)
+    Slot_mapping_ptr,  # [N] int32 — per-token slot indices
+    # Cache strides (for computing byte offsets)
+    stride_cache_block: tl.constexpr,
+    stride_cache_pos: tl.constexpr,
+    stride_cache_head: tl.constexpr,
+    # Dimensions
+    D: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    # TQ layout
+    KPS: tl.constexpr,
+    # Value quantization
+    VQB: tl.constexpr,
+    VAL_DATA_BYTES: tl.constexpr,
+    # Packing block sizes
+    BLOCK_VAL: tl.constexpr,
+    BLOCK_GRP: tl.constexpr = 16,
+    FP8_E4B15: tl.constexpr = 0,  # 1 = e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+):
+    """FP8 key cast+scatter + value uniform quantization: one program per (token, head)."""
+    pid = tl.program_id(0)
+    token_idx = pid // H
+    head_idx = pid % H
+
+    slot = tl.load(Slot_mapping_ptr + token_idx)
+    if slot < 0:
+        return
+    blk = slot // BLOCK_SIZE
+    off = slot % BLOCK_SIZE
+    slot_base = blk * stride_cache_block + off * stride_cache_pos + head_idx * stride_cache_head
+
+    base = pid * D
+
+    # ── FP8 KEY: cast to FP8 in-kernel and store ─────────────────
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < D
+    k_vals = tl.load(Key_ptr + base + d_offs, mask=d_mask, other=0.0)
+    if FP8_E4B15:
+        k_fp8 = k_vals.to(tl.float8e4b15)
+    else:
+        k_fp8 = k_vals.to(tl.float8e4nv)
+    k_bytes = k_fp8.to(tl.uint8, bitcast=True)
+    tl.store(KV_cache_ptr + slot_base + d_offs, k_bytes, mask=d_mask)
+
+    # ── VALUE QUANTIZE + PACK ───────────────────────────────────────
+    _store_quantized_value(
+        Value_ptr, KV_cache_ptr, base, slot_base, d_offs, d_mask,
+        D=D, KPS=KPS, VQB=VQB, VAL_DATA_BYTES=VAL_DATA_BYTES,
+        BLOCK_VAL=BLOCK_VAL, BLOCK_GRP=BLOCK_GRP,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -196,7 +230,6 @@ def _tq_fused_store_mse(
     d_mask = d_offs < D
 
     # ── 1. INLINE BUCKETIZE ──────────────────────────────────────────
-    # idx[d] = count(y[d] >= midpoint[i]) — equivalent to torch.bucketize
     y_vec = tl.load(Y_ptr + base + d_offs, mask=d_mask, other=0.0)
     idx = tl.zeros([BLOCK_D], dtype=tl.int32)
     for i in range(N_CENTROIDS - 1):
@@ -210,9 +243,8 @@ def _tq_fused_store_mse(
 
     # ── 3. PACK MSE INDICES from register idx ─────────────────────────
     if MSE_BITS == 4:
-        # Reshape [BLOCK_D] → [BLOCK_D//2, 2], pack pairs into nibbles
         idx_pairs = tl.reshape(idx, [BLOCK_D // 2, 2])
-        shifts_4 = tl.arange(0, 2) * 4  # [0, 4]
+        shifts_4 = tl.arange(0, 2) * 4
         packed = tl.sum(
             (idx_pairs & 0xF) << shifts_4[None, :], axis=1
         ).to(tl.uint8)
@@ -221,7 +253,6 @@ def _tq_fused_store_mse(
         tl.store(KV_cache_ptr + slot_base + mse_offs, packed, mask=mse_mask)
 
     elif MSE_BITS == 3:
-        # Reshape [BLOCK_D] → [BLOCK_GRP, 8], pack 8 indices into 3 bytes
         grp_offs = tl.arange(0, BLOCK_GRP)
         grp_mask = grp_offs < (D // 8)
         idx_grp = tl.reshape(idx, [BLOCK_GRP, 8])
@@ -254,81 +285,11 @@ def _tq_fused_store_mse(
              ((gm_u16 >> 8) & 0xFF).to(tl.uint8))
 
     # ── 5. VALUE QUANTIZE + PACK ──────────────────────────────────────
-    val_cache_offset = KPS
-
-    if VQB == 3:
-        val_vec = tl.load(Value_ptr + base + d_offs, mask=d_mask, other=0.0)
-        val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
-        val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
-        v_scale = (val_max - val_min) / 7.0
-        v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
-
-        q_vals = tl.minimum(tl.maximum(
-            ((val_vec - val_min) / v_scale + 0.5).to(tl.int32), 0), 7)
-
-        grp_offs2 = tl.arange(0, BLOCK_GRP)
-        grp_mask2 = grp_offs2 < (D // 8)
-        q_grp = tl.reshape(q_vals, [BLOCK_GRP, 8])
-        shifts_3bit = tl.arange(0, 8) * 3
-        packed_24v = tl.sum(q_grp << shifts_3bit[None, :], axis=1)
-        vb0 = (packed_24v & 0xFF).to(tl.uint8)
-        vb1 = ((packed_24v >> 8) & 0xFF).to(tl.uint8)
-        vb2 = ((packed_24v >> 16) & 0xFF).to(tl.uint8)
-        tl.store(KV_cache_ptr + slot_base + val_cache_offset + grp_offs2 * 3,
-                 vb0, mask=grp_mask2)
-        tl.store(KV_cache_ptr + slot_base + val_cache_offset + grp_offs2 * 3 + 1,
-                 vb1, mask=grp_mask2)
-        tl.store(KV_cache_ptr + slot_base + val_cache_offset + grp_offs2 * 3 + 2,
-                 vb2, mask=grp_mask2)
-
-        sc_offset = val_cache_offset + VAL_DATA_BYTES
-        sc_f16 = v_scale.to(tl.float16)
-        sc_u16 = sc_f16.to(tl.uint16, bitcast=True)
-        tl.store(KV_cache_ptr + slot_base + sc_offset,
-                 (sc_u16 & 0xFF).to(tl.uint8))
-        tl.store(KV_cache_ptr + slot_base + sc_offset + 1,
-                 ((sc_u16 >> 8) & 0xFF).to(tl.uint8))
-        zr_f16 = val_min.to(tl.float16)
-        zr_u16 = zr_f16.to(tl.uint16, bitcast=True)
-        tl.store(KV_cache_ptr + slot_base + sc_offset + 2,
-                 (zr_u16 & 0xFF).to(tl.uint8))
-        tl.store(KV_cache_ptr + slot_base + sc_offset + 3,
-                 ((zr_u16 >> 8) & 0xFF).to(tl.uint8))
-
-    else:  # VQB == 4
-        val_vec = tl.load(Value_ptr + base + d_offs, mask=d_mask, other=0.0)
-        val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
-        val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
-        v_scale = (val_max - val_min) / 15.0
-        v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
-
-        val_offs = tl.arange(0, BLOCK_VAL)
-        val_mask = val_offs < VAL_DATA_BYTES
-        v0 = tl.load(Value_ptr + base + val_offs * 2,
-                     mask=val_mask & (val_offs * 2 < D), other=val_min)
-        v1 = tl.load(Value_ptr + base + val_offs * 2 + 1,
-                     mask=val_mask & (val_offs * 2 + 1 < D), other=val_min)
-        q0 = tl.minimum(tl.maximum(
-            ((v0 - val_min) / v_scale + 0.5).to(tl.int32), 0), 15)
-        q1 = tl.minimum(tl.maximum(
-            ((v1 - val_min) / v_scale + 0.5).to(tl.int32), 0), 15)
-        packed_val = (q0 | (q1 << 4)).to(tl.uint8)
-        tl.store(KV_cache_ptr + slot_base + val_cache_offset + val_offs,
-                 packed_val, mask=val_mask)
-
-        sc_offset = val_cache_offset + VAL_DATA_BYTES
-        sc_f16 = v_scale.to(tl.float16)
-        sc_u16 = sc_f16.to(tl.uint16, bitcast=True)
-        tl.store(KV_cache_ptr + slot_base + sc_offset,
-                 (sc_u16 & 0xFF).to(tl.uint8))
-        tl.store(KV_cache_ptr + slot_base + sc_offset + 1,
-                 ((sc_u16 >> 8) & 0xFF).to(tl.uint8))
-        zr_f16 = val_min.to(tl.float16)
-        zr_u16 = zr_f16.to(tl.uint16, bitcast=True)
-        tl.store(KV_cache_ptr + slot_base + sc_offset + 2,
-                 (zr_u16 & 0xFF).to(tl.uint8))
-        tl.store(KV_cache_ptr + slot_base + sc_offset + 3,
-                 ((zr_u16 >> 8) & 0xFF).to(tl.uint8))
+    _store_quantized_value(
+        Value_ptr, KV_cache_ptr, base, slot_base, d_offs, d_mask,
+        D=D, KPS=KPS, VQB=VQB, VAL_DATA_BYTES=VAL_DATA_BYTES,
+        BLOCK_VAL=BLOCK_VAL, BLOCK_GRP=BLOCK_GRP,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -346,7 +307,6 @@ def triton_turboquant_store(
     mse_bits: int,
     key_packed_size: int,
     value_quant_bits: int,
-    value_packed_size: int,
     key_fp8: bool = False,
 ):
     """Launch TQ store kernel — FP8 uses _tq_fused_store_fp8, MSE uses _tq_fused_store_mse."""
@@ -368,19 +328,19 @@ def triton_turboquant_store(
     stride_pos = num_kv_heads * padded_slot
     stride_head = padded_slot
 
-    # ── FP8 PATH: cast to FP8 + scatter via fp8 kernel ──
+    block_grp = triton.next_power_of_2(D // 8) if D >= 8 else 1
+
+    # ── FP8 PATH: in-kernel FP8 cast + scatter via fp8 kernel ──
     if key_fp8:
         k_flat = key.reshape(NH, D).contiguous()
         v_flat = value.reshape(NH, D).contiguous()
 
-        k_fp8 = k_flat.to(torch.float8_e4m3fn)
-        k_fp8_u8 = k_fp8.view(torch.uint8)
+        fp8_e4b15 = _use_fp8_e4b15(key.device.index or 0)
 
-        block_grp = triton.next_power_of_2(D // 8) if D >= 8 else 1
         grid = (NH,)
         _tq_fused_store_fp8[grid](
-            v_flat,
-            kv_cache.view(-1), slot_mapping, k_fp8_u8,
+            k_flat, v_flat,
+            kv_cache.view(-1), slot_mapping,
             stride_cache_block=stride_block,
             stride_cache_pos=stride_pos,
             stride_cache_head=stride_head,
@@ -388,13 +348,12 @@ def triton_turboquant_store(
             KPS=key_packed_size,
             VQB=value_quant_bits, VAL_DATA_BYTES=val_data_bytes,
             BLOCK_VAL=BLOCK_VAL, BLOCK_GRP=block_grp,
+            FP8_E4B15=fp8_e4b15,
             num_warps=4, num_stages=1,
         )
         return
 
     # ── MSE PATH: external GEMM + fused bucketize/pack kernel ──
-    block_grp = triton.next_power_of_2(D // 8) if D >= 8 else 1
-
     # Normalize + rotation GEMM externally (cuBLAS is faster than in-kernel)
     k_flat = key.float().reshape(NH, D)
     norms = k_flat.norm(dim=1, keepdim=True)
